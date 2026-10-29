@@ -1,17 +1,111 @@
 import test from 'node:test';
 import assert from 'node:assert/strict';
-import { LocalLibrary, isAudioFile, fileKey, guessMetadata, artworkFromPicture } from '../library.js';
+import { LocalLibrary, isAudioFile, fileKey, guessMetadata, artworkFromPicture, savedTrackIdentity } from '../library.js';
 
 test('audio file selection accepts audio MIME or known extensions without admitting arbitrary documents', () => {
   assert.equal(isAudioFile({ name: 'song.MP3', type: '' }), true);
   assert.equal(isAudioFile({ name: 'voice.bin', type: 'audio/ogg' }), true);
   assert.equal(isAudioFile({ name: 'song.m4a', type: 'video/mp4' }), true);
-  for (const extension of ['aac', 'wav', 'wave', 'flac', 'ogg', 'oga', 'opus', 'aif', 'aiff', 'mp4']) {
+  for (const extension of ['aac', 'wav', 'wave', 'flac', 'ogg', 'oga', 'opus', 'aif', 'aiff', 'mp4', 'ncm']) {
     assert.equal(isAudioFile({ name: `song.${extension}`, type: '' }), true);
   }
   assert.equal(isAudioFile({ name: 'music.html', type: 'text/html' }), false);
   assert.equal(isAudioFile({ name: 'album.png', type: 'image/png' }), false);
   assert.equal(isAudioFile(null), false);
+});
+
+test('a converted NCM track plays the decoded File and retains its original fingerprint for deduplication', async () => {
+  const originalReader = globalThis.jsmediatags;
+  const source = new File(['encrypted source'], 'Artist - Song.ncm', { lastModified: 100 });
+  const decoded = new File(['decoded audio'], 'opaque.mp3', { type: 'audio/mpeg', lastModified: 200 });
+  globalThis.jsmediatags = { read(file, callbacks) { callbacks.onError(new Error('no embedded tags')); } };
+  const library = new LocalLibrary({ decodeNcmFile: async file => {
+    assert.equal(file, source);
+    return { file: decoded, metadata: {}, artworkBlob: null };
+  } });
+  try {
+    assert.deepEqual(await library.importFiles([source]), { added: 1, duplicates: 0, rejected: 0 });
+    const track = library.tracks[0];
+    assert.equal(track.file, decoded);
+    assert.equal(track.id, fileKey(source));
+    assert.notEqual(track.id, fileKey(decoded));
+    assert.equal(track.sourceName, source.name);
+    assert.equal(track.convertedFromNcm, true);
+    assert.equal(track.title, 'Song');
+    assert.equal(track.artist, 'Artist');
+    assert.deepEqual(await library.importFiles([source]), { added: 0, duplicates: 1, rejected: 0 });
+  } finally { library.destroy(); globalThis.jsmediatags = originalReader; }
+});
+
+test('an invalid NCM rejects only itself while a regular audio file in the same batch still imports', async () => {
+  const library = new LocalLibrary();
+  try {
+    const result = await library.importFiles([
+      new File(['not an NCM'], 'broken.ncm'),
+      new File(['plain audio'], 'good.mp3', { type: 'audio/mpeg' }),
+    ]);
+    assert.deepEqual(result, { added: 1, duplicates: 0, rejected: 1 });
+    assert.equal(library.tracks[0].sourceName, 'good.mp3');
+    assert.equal(library.tracks[0].convertedFromNcm, false);
+    assert.equal(library.lastImportErrors[0].name, 'broken.ncm');
+  } finally { library.destroy(); }
+});
+
+test('restoring converted files preserves source identity and conversion flags without an encrypted copy', () => {
+  const source = new File(['encrypted'], 'Original.ncm', { lastModified: 42 });
+  const decoded = new File(['audio'], 'Original.flac', { type: 'audio/flac', lastModified: 50 });
+  const record = { id: fileKey(source), convertedFromNcm: true, sourceName: source.name, file: decoded };
+  assert.deepEqual(savedTrackIdentity(record, decoded), { id: fileKey(source), convertedFromNcm: true, sourceName: source.name });
+  assert.equal(savedTrackIdentity({ ...record, sourceName: 'wrong.ncm' }, decoded).id, fileKey(decoded));
+  assert.equal(savedTrackIdentity({ ...record, id: 'invalid' }, decoded).convertedFromNcm, false);
+});
+
+test('NCM decoding is serialized while ordinary metadata reading can proceed', async () => {
+  const originalReader = globalThis.jsmediatags;
+  let active = 0, peak = 0, ordinaryReadDuringConversion = false;
+  globalThis.jsmediatags = { read(file, callbacks) {
+    setTimeout(() => {
+      if (file.name === 'ordinary.mp3' && active > 0) ordinaryReadDuringConversion = true;
+      callbacks.onSuccess({ tags: {} });
+    }, 3);
+  } };
+  const library = new LocalLibrary({ decodeNcmFile: async (file, { onProgress }) => {
+    active++; peak = Math.max(peak, active); onProgress(.1);
+    await new Promise(resolve => setTimeout(resolve, 8));
+    active--; onProgress(1);
+    return { file: new File(['audio'], file.name.replace(/\.ncm$/, '.mp3')), metadata: {} };
+  } });
+  try {
+    const importing = library.importFiles([
+      new File(['one'], 'one.ncm'), new File(['two'], 'two.ncm'),
+      new File(['ordinary'], 'ordinary.mp3'),
+    ]);
+    const result = await importing;
+    assert.equal(result.added, 3);
+    assert.equal(peak, 1);
+    // Normal reads start independently; they must not await either NCM decode.
+    assert.equal(ordinaryReadDuringConversion, true);
+    assert.equal(library.tracks[2].sourceName, 'ordinary.mp3');
+    assert.equal(library.progress.done, 3);
+  } finally { library.destroy(); globalThis.jsmediatags = originalReader; }
+});
+
+test('clear during NCM conversion aborts it through progress and leaves no restored track', async () => {
+  let advance;
+  const library = new LocalLibrary({ decodeNcmFile: async (file, { onProgress }) => {
+    await new Promise(resolve => { advance = resolve; });
+    onProgress(.5);
+    return { file: new File(['audio'], 'converted.mp3'), metadata: {} };
+  } });
+  try {
+    const importing = library.importFiles([new File(['encrypted'], 'pending.ncm')]);
+    while (!advance) await new Promise(resolve => setTimeout(resolve, 0));
+    await library.clear();
+    advance();
+    assert.deepEqual(await importing, { added: 0, duplicates: 0, rejected: 1 });
+    assert.equal(library.tracks.length, 0);
+    assert.deepEqual(library.lastImportErrors, []);
+  } finally { library.destroy(); }
 });
 
 test('stable file keys include name, size and modified time and avoid separator collisions', () => {

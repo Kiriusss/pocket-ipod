@@ -27,7 +27,7 @@ test('every linked application asset is shipped locally, without third-party req
 });
 
 test('application code contains no network transport calls', async () => {
-  for (const file of ['app.js', 'player.js', 'library.js']) {
+  for (const file of ['app.js', 'player.js', 'library.js', 'ncm.js', 'theme-init.js', 'games/index.js', 'games/brick.js', 'games/parachute.js', 'games/solitaire.js']) {
     const source = await readFile(new URL(file, root), 'utf8');
     assert.doesNotMatch(source, /\b(?:fetch|WebSocket|XMLHttpRequest|EventSource)\s*\(|\.sendBeacon\s*\(/, `${file} must not send music or metadata`);
   }

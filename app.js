@@ -1,5 +1,6 @@
 import { LocalPlayer } from './player.js';
 import { LocalLibrary } from './library.js';
+import { games } from './games/index.js';
 
 const $ = id => document.getElementById(id);
 const player = new LocalPlayer($('audio'));
@@ -7,6 +8,7 @@ const library = new LocalLibrary();
 const menuStack = [{ type: 'root', title: 'iPod', selected: 0 }];
 let locked = false;
 let finish = 'silver';
+let darkMode = document.documentElement.dataset.theme === 'dark';
 let clickSound = false;
 let wheelAudio;
 let previousVolume = .7;
@@ -14,6 +16,10 @@ let clearArmed = false;
 let toastTimer;
 let search = '';
 let lastTrackId;
+let activeGame = null;
+const gameHelp = document.createElement('p');
+gameHelp.className = 'game-help'; gameHelp.hidden = true;
+document.querySelector('.device-stage').append(gameHelp);
 const repeatLabels = { off: '关闭', all: '全部', one: '单曲' };
 const time = value => { const seconds = Number.isFinite(value) ? Math.max(0, Math.floor(value)) : 0; return `${Math.floor(seconds / 60)}:${String(seconds % 60).padStart(2, '0')}`; };
 const currentView = () => menuStack.at(-1);
@@ -51,6 +57,7 @@ function go(type, title, extra = {}) {
 function rootMenu() { menuStack.splice(1); menuStack[0].selected = 0; renderScreen(); }
 function nowPlaying() {
   if (!player.currentTrack) { toast('先选择一些本地音乐，再按下播放。'); return; }
+  if (currentView().type === 'game') menuStack.pop();
   if (currentView().type !== 'now') go('now', '正在播放'); else renderScreen();
 }
 function back() {
@@ -69,15 +76,28 @@ function chooseTrack(track) {
   nowPlaying();
 }
 
+function openGame(game) {
+  player.pause();
+  go('game', game.title, { gameID: game.id });
+}
+
+function gameInput(action, value = 1) {
+  if (locked || currentView().type !== 'game') return false;
+  activeGame?.controller.input(action, value);
+  return true;
+}
+
 function getRows(view = currentView()) {
   if (view.type === 'root') return [
     { label: '音乐', action: () => go('music', '音乐') },
     { label: '随机播放歌曲', action: () => { if (!library.tracks.length) return toast('曲库还是空的，先添加本地音乐。'); player.setShuffle(false); player.playIndex(Math.floor(Math.random() * library.tracks.length)); player.setShuffle(true); savePreferences(); nowPlaying(); } },
     { label: '正在播放', action: nowPlaying },
     { label: '设置', action: () => go('settings', '设置') },
+    { label: '游戏', action: () => go('games', '游戏') },
     { label: '关于 Pocket', action: () => go('about', '关于') },
     { label: '添加本地音乐', action: () => $('file-input').click() }
   ];
+  if (view.type === 'games') return games.map(game => ({ label: game.title, action: () => openGame(game) }));
   if (view.type === 'music') return [
     { label: '所有歌曲', value: String(library.tracks.length), action: () => go('songs', '所有歌曲') },
     { label: '艺术家', action: () => go('artists', '艺术家') },
@@ -96,6 +116,7 @@ function getRows(view = currentView()) {
     { label: '音量', value: `${Math.round(player.volume * 100)}%`, action: () => go('volume', '音量') },
     { label: '转盘声', value: clickSound ? '开启' : '关闭', action: () => { clickSound = !clickSound; tick(); savePreferences(); renderScreen(); } },
     { label: '外观', value: finish === 'silver' ? '银色' : '石墨色', action: () => setFinish(finish === 'silver' ? 'graphite' : 'silver') },
+    { label: '黑夜模式', value: darkMode ? '开启' : '关闭', action: () => setTheme(darkMode ? 'light' : 'dark') },
     { label: '返回主菜单', action: rootMenu }
   ];
   return [];
@@ -108,11 +129,34 @@ function artwork(track, className) {
 
 function renderScreen() {
   const view = currentView();
-  const content = $('screen-content'); content.replaceChildren();
+  const content = $('screen-content');
+  if (view.type !== 'game' && activeGame) { activeGame.controller.destroy(); activeGame = null; }
+  gameHelp.hidden = view.type !== 'game';
   $('screen-title').textContent = view.title;
   $('screen-status').textContent = player.playing ? '▶' : 'Ⅱ';
   $('screen-status').setAttribute('aria-label', player.playing ? '正在播放' : '已暂停');
   $('lock-indicator').hidden = !locked;
+  if (view.type === 'game') {
+    const definition = games.find(game => game.id === view.gameID);
+    if (!definition) { menuStack.pop(); renderScreen(); return; }
+    gameHelp.textContent = `${definition.help} MENU 返回游戏菜单。`;
+    if (activeGame?.view !== view) {
+      activeGame?.controller.destroy();
+      const canvas = document.createElement('canvas');
+      canvas.width = 560; canvas.height = 328; canvas.className = 'game-canvas';
+      canvas.setAttribute('role', 'img'); canvas.setAttribute('aria-label', `${definition.title}。${definition.help}`);
+      for (const name of ['pointerdown','pointerup','click','dblclick']) canvas.addEventListener(name, event => { if (locked) { event.preventDefault(); event.stopImmediatePropagation(); } }, true);
+      content.replaceChildren(canvas);
+      const controller = definition.create({ canvas, getTheme: () => darkMode ? 'dark' : 'light', onStatus: message => { view.gameStatus = message; if (currentView() === view) $('screen-footer').lastElementChild.textContent = locked ? 'HOLD · 游戏已暂停' : message; } });
+      activeGame = { view, controller };
+    }
+    activeGame.controller.render();
+    $('screen-footer').firstElementChild.textContent = 'GAMES';
+    $('screen-footer').lastElementChild.textContent = locked ? 'HOLD · 游戏已暂停' : (view.gameStatus || '中键开始 · MENU 返回');
+    return;
+  }
+  content.replaceChildren();
+  $('screen-footer').firstElementChild.textContent = 'POCKET';
   if (view.type === 'now') {
     const track = player.currentTrack;
     if (!track) { menuStack.pop(); renderScreen(); return; }
@@ -170,6 +214,7 @@ function renderScreen() {
 function scrollMenu(steps) {
   if (locked || !steps) return;
   const view=currentView();
+  if (view.type==='game') { gameInput('move',steps); return; }
   if (view.type==='now'||view.type==='volume') { player.setVolume(player.volume+steps*.025); savePreferences(); return; }
   const rows=getRows(view); if (!rows.length) return;
   const next=Math.max(0,Math.min(rows.length-1,view.selected+steps));
@@ -178,6 +223,7 @@ function scrollMenu(steps) {
 function select() {
   if (locked) return toast('HOLD 已开启，先解锁机身上方的开关。');
   tick();
+  if (gameInput('select')) return;
   if (currentView().type==='now') return player.toggle();
   if (currentView().type==='about'||currentView().type==='volume') return back();
   getRows()[currentView().selected]?.action();
@@ -189,6 +235,7 @@ function renderLibrary() {
   $('clear-button').disabled=!library.tracks.length;
   $('remember-checkbox').checked=library.remember;
   $('storage-note').textContent=library.remember?'曲库已保留在此浏览器，不会上传。':'默认仅本次打开可用，刷新后需重新选择。';
+  if(library.tracks.some(track=>track.convertedFromNcm))$('storage-note').textContent+=' NCM 歌曲右侧 ↓ 可下载解包音乐。';
   $('import-button').disabled=library.importing; $('append-button').disabled=library.importing;
   $('import-button').lastChild.textContent=library.importing?'正在本地读取…':'选择本地音乐';
   const list=$('track-list'); list.replaceChildren();
@@ -203,8 +250,22 @@ function renderLibrary() {
     const artist=document.createElement('small'); artist.textContent=track.artist; text.append(name,artist); button.append(text);
     button.addEventListener('click',()=>chooseTrack(track));
     const remove=document.createElement('button'); remove.className='track-remove'; remove.textContent='×'; remove.setAttribute('aria-label',`移除 ${track.title}`); remove.addEventListener('click',()=>library.remove(track.id));
-    row.append(button,remove); list.append(row);
+    row.append(button);
+    if (track.convertedFromNcm) {
+      const download=document.createElement('button'); download.className='track-download'; download.textContent='↓';
+      download.title='下载解包后的音乐'; download.setAttribute('aria-label',`下载 ${track.title} 的解包音乐`);
+      download.addEventListener('click',()=>downloadTrack(track)); row.append(download);
+    }
+    row.append(remove); list.append(row);
   }
+}
+
+function downloadTrack(track) {
+  const url=URL.createObjectURL(track.file);
+  const link=document.createElement('a'); link.href=url; link.download=track.file.name;
+  document.body.append(link); link.click(); link.remove();
+  setTimeout(()=>URL.revokeObjectURL(url),60000);
+  toast('已开始保存解包后的音乐，文件来自当前浏览器。');
 }
 
 function updateTime() {
@@ -238,19 +299,34 @@ function updatePlayer() {
 }
 
 function savePreferences() {
-  try { localStorage.setItem('pocket-preferences',JSON.stringify({volume:player.volume,shuffle:player.shuffle,repeat:player.repeat,finish,clickSound})); } catch { /* Session settings remain usable. */ }
+  try { localStorage.setItem('pocket-preferences',JSON.stringify({volume:player.volume,shuffle:player.shuffle,repeat:player.repeat,finish,clickSound,theme:darkMode?'dark':'light'})); } catch { /* Session settings remain usable. */ }
+}
+function applyTheme(value) {
+  darkMode=value==='dark';
+  document.documentElement.dataset.theme=darkMode?'dark':'light';
+  document.querySelector('meta[name="theme-color"]').content=darkMode?'#141615':'#eeede7';
+  $('theme-toggle').setAttribute('aria-pressed',String(darkMode));
+  $('theme-toggle').setAttribute('aria-label',darkMode?'切换至日间模式':'开启黑夜模式');
+  $('theme-label').textContent=darkMode?'日间':'夜间';
+}
+function setTheme(value) {
+  applyTheme(value);
+  setFinish(darkMode?'graphite':'silver');
 }
 function setFinish(value) {
+  if(value==='silver'&&darkMode)applyTheme('light');
   finish=value; $('ipod').classList.toggle('graphite',value==='graphite');
   document.querySelectorAll('[data-finish]').forEach(button=>{ const selected=button.dataset.finish===value; button.classList.toggle('selected',selected); button.setAttribute('aria-pressed',String(selected)); });
   $('finish-label').textContent=value==='silver'?'银色':'石墨色'; savePreferences(); renderScreen();
 }
 try {
-  const prefs=JSON.parse(localStorage.getItem('pocket-preferences')??'{}');
+  const prefs=JSON.parse(localStorage.getItem('pocket-preferences')??'{}')??{};
   player.setVolume(Number.isFinite(prefs.volume)?prefs.volume:.7); player.setShuffle(!!prefs.shuffle);
   player.setRepeat(['off','all','one'].includes(prefs.repeat)?prefs.repeat:'off'); clickSound=!!prefs.clickSound;
-  if (prefs.finish==='graphite') setFinish('graphite');
+  applyTheme(darkMode?'dark':'light');
+  setFinish(darkMode||prefs.finish==='graphite'?'graphite':'silver');
 } catch { player.setVolume(.7); }
+applyTheme(darkMode?'dark':'light');
 
 player.addEventListener('change',updatePlayer); player.addEventListener('time',updateTime);
 player.addEventListener('playerror',event=>toast(event.detail?.message??'这首歌暂时无法播放，请试试其他格式的文件。'));
@@ -261,7 +337,8 @@ async function importFiles(files) {
   if (!files?.length) return;
   try {
     const result=await library.importFiles(files);
-    toast(result.added?`已把 ${result.added} 首歌放进口袋${result.duplicates?`，跳过 ${result.duplicates} 首重复歌曲`:''}。`:(result.duplicates?'这些歌已经在口袋里了。':'没有找到支持的音频文件。'));
+    if(!result.added&&library.lastImportErrors?.length){toast(library.lastImportErrors[0].message);return;}
+    toast(result.added?`已把 ${result.added} 首歌放进口袋${result.duplicates?`，跳过 ${result.duplicates} 首重复歌曲`:''}${result.rejected?`，${result.rejected} 个文件未能读取`:''}。`:(result.duplicates?'这些歌已经在口袋里了。':(result.rejected?'文件未能读取或解包，请检查格式及文件是否完整。':'没有找到支持的音频文件。')));
   } catch { toast('本地文件读取未完成，请分批重新选择音乐。'); }
 }
 for (const id of ['import-button','add-more','append-button']) $(id).addEventListener('click',()=>$('file-input').click());
@@ -275,16 +352,17 @@ $('clear-button').addEventListener('click',async()=>{
 $('volume-range').addEventListener('input',()=>{ player.setVolume(Number($('volume-range').value)/100); savePreferences(); });
 $('mute-button').addEventListener('click',()=>{ if(player.volume>0){previousVolume=player.volume;player.setVolume(0);}else player.setVolume(previousVolume||.7); savePreferences(); });
 document.querySelectorAll('[data-finish]').forEach(button=>button.addEventListener('click',()=>setFinish(button.dataset.finish)));
-$('hold-button').addEventListener('click',()=>{ locked=!locked; $('hold-button').setAttribute('aria-checked',String(locked)); $('ipod').classList.toggle('locked',locked); renderScreen(); toast(locked?'HOLD 已开启：转盘锁定，播放继续。':'已解锁，继续转动转盘。'); });
+$('theme-toggle').addEventListener('click',()=>setTheme(darkMode?'light':'dark'));
+$('hold-button').addEventListener('click',()=>{ locked=!locked; if(locked)activeGame?.controller.pause(); $('hold-button').setAttribute('aria-checked',String(locked)); $('ipod').classList.toggle('locked',locked); renderScreen(); toast(locked?(activeGame?'HOLD 已开启，游戏已暂停。':'HOLD 已开启：转盘锁定，播放继续。'):'已解锁，继续转动转盘。'); });
 $('menu-button').addEventListener('click',back); $('select-button').addEventListener('click',select);
-$('toggle-button').addEventListener('click',()=>{ if(locked)return toast('先关闭 HOLD，再操作。'); if(!player.currentTrack)return toast('先添加本地音乐，或点击“先听一段”。'); player.toggle(); nowPlaying(); });
+$('toggle-button').addEventListener('click',()=>{ if(locked)return toast('先关闭 HOLD，再操作。'); if(gameInput('play'))return; if(!player.currentTrack)return toast('先添加本地音乐，或点击“先听一段”。'); player.toggle(); nowPlaying(); });
 
 for (const [id, direction] of [['previous-button',-1],['next-button',1]]) {
   const button=$(id); let timer; let interval; let held=false;
   const stop=()=>{clearTimeout(timer);clearInterval(interval);};
-  button.addEventListener('pointerdown',event=>{ if(locked||event.button!==0)return; held=false; button.setPointerCapture(event.pointerId); timer=setTimeout(()=>{held=true;player.seek(player.currentTime+direction*5);interval=setInterval(()=>player.seek(player.currentTime+direction*3),180);},450); });
+  button.addEventListener('pointerdown',event=>{ held=false; if(locked||event.button!==0||currentView().type==='game')return; button.setPointerCapture(event.pointerId); timer=setTimeout(()=>{held=true;player.seek(player.currentTime+direction*5);interval=setInterval(()=>player.seek(player.currentTime+direction*3),180);},450); });
   for(const event of ['pointerup','pointercancel','lostpointercapture'])button.addEventListener(event,stop);
-  button.addEventListener('click',()=>{ if(locked)return toast('先关闭 HOLD，再操作。'); if(held){held=false;return;} if(!player.currentTrack)return toast('先添加几首歌到曲库。'); direction>0?player.next():player.previous(); nowPlaying(); });
+  button.addEventListener('click',()=>{ if(locked)return toast('先关闭 HOLD，再操作。'); if(gameInput('move',direction))return; if(held){held=false;return;} if(!player.currentTrack)return toast('先添加几首歌到曲库。'); direction>0?player.next():player.previous(); nowPlaying(); });
 }
 
 let wheelGesture;
@@ -309,6 +387,16 @@ wheel.addEventListener('wheel',event=>{event.preventDefault();if(locked)return;w
 document.addEventListener('keydown',event=>{
   if(event.altKey||event.ctrlKey||event.metaKey||$('privacy-dialog').open||event.target.matches('input,textarea,select'))return;
   if(event.target.closest('button')&&['Enter',' '].includes(event.key))return;
+  if(currentView().type==='game'&&['ArrowUp','ArrowDown','ArrowLeft','ArrowRight','Enter','Escape',' ','r','R','u','U'].includes(event.key)){
+    event.preventDefault();if(locked)return;
+    if(event.key==='Escape')back();
+    else if(event.key==='r'||event.key==='R'){if(!event.repeat)gameInput('restart');}
+    else if(event.key==='u'||event.key==='U'){if(!event.repeat)gameInput('undo');}
+    else if(event.key==='Enter'||event.key===' '){if(!event.repeat)gameInput('select');}
+    else if((currentView().gameID==='solitaire'||event.shiftKey)&&(event.key==='ArrowUp'||event.key==='ArrowDown'))gameInput(event.key==='ArrowUp'?'up':'down');
+    else gameInput('move',(event.key==='ArrowLeft'||event.key==='ArrowUp')?-1:1);
+    return;
+  }
   const keys=['ArrowUp','ArrowDown','ArrowLeft','ArrowRight','Enter','Escape',' '];
   if(!keys.includes(event.key))return;event.preventDefault();if(locked)return;
   if(event.key==='ArrowUp')scrollMenu(-1); else if(event.key==='ArrowDown')scrollMenu(1);
@@ -324,6 +412,8 @@ document.addEventListener('dragover',event=>{if(Array.from(event.dataTransfer?.t
 document.addEventListener('dragleave',()=>{dragDepth=Math.max(0,dragDepth-1);if(!dragDepth)$('drop-overlay').hidden=true;});
 document.addEventListener('drop',event=>{event.preventDefault();dragDepth=0;$('drop-overlay').hidden=true;importFiles(Array.from(event.dataTransfer?.files??[]));});
 $('privacy-button').addEventListener('click',()=>$('privacy-dialog').showModal());
+$('privacy-button').addEventListener('click',()=>activeGame?.controller.pause());
+document.addEventListener('visibilitychange',()=>{if(document.hidden)activeGame?.controller.pause();});
 for(const id of ['close-privacy','privacy-done'])$(id).addEventListener('click',()=>$('privacy-dialog').close());
 $('privacy-dialog').addEventListener('click',event=>{if(event.target===$('privacy-dialog'))$('privacy-dialog').close();});
 
@@ -361,4 +451,4 @@ if('mediaSession'in navigator){
 }
 updatePlayer();renderLibrary();
 library.init().catch(()=>toast('无法恢复本地曲库，重新选择文件即可继续。'));
-window.addEventListener('pagehide',event=>{if(!event.persisted){player.destroy();library.destroy();}});
+window.addEventListener('pagehide',event=>{activeGame?.controller.pause();if(!event.persisted){activeGame?.controller.destroy();player.destroy();library.destroy();}});

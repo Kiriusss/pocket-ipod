@@ -1,8 +1,12 @@
-const AUDIO_EXTENSION = /\.(mp3|m4a|aac|wav|wave|flac|ogg|oga|opus|aif|aiff|mp4)$/i;
+import { isNcmFile, decodeNcm } from './ncm.js';
+
+const AUDIO_EXTENSION = /\.(mp3|m4a|aac|wav|wave|flac|ogg|oga|opus|aif|aiff|mp4|ncm)$/i;
 const DATABASE = 'pocket-ipod-local-library';
 const STORE = 'tracks';
 const REMEMBER_KEY = 'pocket-ipod-remember-library';
 const MAX_ARTWORK_BYTES = 8 * 1024 * 1024;
+// Conversions share a queue across library instances to bound peak memory use.
+let ncmDecodeQueue = Promise.resolve();
 
 /** This accepts file-like metadata; importFiles additionally requires a Blob. */
 export function isAudioFile(file) {
@@ -13,6 +17,21 @@ export function isAudioFile(file) {
 /** A stable, unambiguous key; neither paths nor file bytes leave the browser. */
 export function fileKey(file) {
   return JSON.stringify([String(file?.name ?? ''), Number(file?.size) || 0, Number(file?.lastModified) || 0]);
+}
+
+/** Restore the original NCM fingerprint without retaining its encrypted bytes. */
+export function savedTrackIdentity(record, file) {
+  if (record.convertedFromNcm === true && typeof record.id === 'string') {
+    try {
+      const key = JSON.parse(record.id);
+      if (Array.isArray(key) && key.length === 3 && typeof key[0] === 'string' &&
+          /\.ncm$/i.test(key[0]) && key[0] === record.sourceName &&
+          Number.isFinite(key[1]) && key[1] >= 0 && Number.isFinite(key[2]) && key[2] >= 0) {
+        return { id: JSON.stringify(key), convertedFromNcm: true, sourceName: key[0] };
+      }
+    } catch { /* Older or invalid records fall back to the actual playable file. */ }
+  }
+  return { id: fileKey(file), convertedFromNcm: false, sourceName: file.name };
 }
 
 export function guessMetadata(file) {
@@ -52,8 +71,8 @@ export function artworkFromPicture(picture) {
   return type ? new Blob([bytes], { type }) : null;
 }
 
-function readMetadata(file) {
-  const fallback = guessMetadata(file);
+function readMetadata(file, fallbackFile = file) {
+  const fallback = guessMetadata(fallbackFile);
   const reader = globalThis.jsmediatags;
   if (!reader || typeof reader.read !== 'function') return Promise.resolve({ ...fallback, artworkBlob: null });
   return new Promise(resolve => {
@@ -93,13 +112,15 @@ function transactionDone(transaction) {
 }
 
 export class LocalLibrary extends EventTarget {
-  constructor() {
+  constructor({ decodeNcmFile = decodeNcm } = {}) {
     super();
     this.tracks = [];
     this.remember = false;
     this.importing = false;
     this.progress = { done: 0, total: 0 };
     this.lastStorageError = null;
+    this.lastImportErrors = [];
+    this._decodeNcm = decodeNcmFile;
     this._artworkBlobs = new Map();
     this._db = null;
     this._opening = null;
@@ -183,15 +204,16 @@ export class LocalLibrary extends EventTarget {
         if (typeof file.name !== 'string' && record.name && typeof File !== 'undefined') {
           file = new File([file], record.name, { type: file.type, lastModified: record.lastModified || 0 });
         }
-        if (!isAudioFile(file)) continue;
-        const id = fileKey(file);
+        if (!isAudioFile(file) || isNcmFile(file)) continue;
+        const identity = savedTrackIdentity(record, file);
+        const { id } = identity;
         if (existing.has(id)) continue;
         existing.add(id);
         const fallback = guessMetadata(file);
         const artworkBlob = record.artworkBlob instanceof Blob && record.artworkBlob.size <= MAX_ARTWORK_BYTES ? record.artworkBlob : null;
         this._appendTrack(id, file, {
           title: cleanTag(record.title, fallback.title), artist: cleanTag(record.artist, fallback.artist),
-          album: cleanTag(record.album, fallback.album), artworkBlob,
+          album: cleanTag(record.album, fallback.album), artworkBlob, ...identity,
         });
       }
     } catch (error) {
@@ -204,7 +226,10 @@ export class LocalLibrary extends EventTarget {
   _appendTrack(id, file, metadata) {
     const artwork = metadata.artworkBlob ? URL.createObjectURL(metadata.artworkBlob) : null;
     if (metadata.artworkBlob) this._artworkBlobs.set(id, metadata.artworkBlob);
-    const track = { id, title: metadata.title, artist: metadata.artist, album: metadata.album, file, artwork, duration: 0 };
+    const track = {
+      id, title: metadata.title, artist: metadata.artist, album: metadata.album, file, artwork, duration: 0,
+      convertedFromNcm: metadata.convertedFromNcm === true, sourceName: metadata.sourceName || file.name,
+    };
     this.tracks.push(track);
     return track;
   }
@@ -234,24 +259,70 @@ export class LocalLibrary extends EventTarget {
       pending.push({ id, file });
     }
     this.importing = true;
+    this.lastImportErrors = [];
     this.progress = { done: 0, total: pending.length };
     this._changed();
-    let cursor = 0;
     const results = new Array(pending.length);
-    const worker = async () => {
-      while (cursor < pending.length && generation === this._generation && !this._destroyed) {
-        const index = cursor++;
-        results[index] = await readMetadata(pending[index].file);
+    const cancelled = () => generation !== this._generation || this._destroyed;
+    const assertActive = () => {
+      if (cancelled()) { const error = new Error('导入已取消'); error.name = 'AbortError'; throw error; }
+    };
+    const processFile = async index => {
+      const originalFile = pending[index].file;
+      try {
+        let file = originalFile;
+        let converted = null;
+        if (isNcmFile(originalFile)) {
+          const conversion = ncmDecodeQueue.then(() => {
+            assertActive();
+            return this._decodeNcm(originalFile, { onProgress: value => {
+              assertActive();
+              this.progress.conversion = value;
+              this.progress.sourceName = originalFile.name;
+              this._changed();
+            } });
+          });
+          ncmDecodeQueue = conversion.then(() => undefined, () => undefined);
+          converted = await conversion;
+          assertActive();
+          file = converted?.file;
+          if (!(file instanceof Blob) || !file.size || !isAudioFile(file) || isNcmFile(file)) throw new Error('NCM 未能生成有效的音频文件');
+        }
+        const metadata = await readMetadata(file, originalFile);
+        assertActive();
+        if (converted) {
+          metadata.title = cleanTag(converted.metadata?.title, metadata.title);
+          metadata.artist = cleanTag(converted.metadata?.artist, metadata.artist);
+          metadata.album = cleanTag(converted.metadata?.album, metadata.album);
+          const artworkBlob = converted.artworkBlob;
+          if (artworkBlob instanceof Blob && artworkBlob.size <= MAX_ARTWORK_BYTES &&
+              /^image\/(jpeg|png|webp|gif)$/.test(artworkBlob.type)) metadata.artworkBlob = artworkBlob;
+        }
+        results[index] = { file, metadata: { ...metadata, convertedFromNcm: Boolean(converted), sourceName: originalFile.name } };
+      } catch (error) {
+        if (!cancelled()) this.lastImportErrors.push({ name: originalFile.name, message: error?.message || '无法读取此文件' });
+        results[index] = null;
+      } finally {
         this.progress.done++;
         this._changed();
       }
     };
+    const regular = [], ncm = [];
+    pending.forEach(({ file }, index) => (isNcmFile(file) ? ncm : regular).push(index));
+    let regularCursor = 0;
+    const regularWorker = async () => {
+      while (regularCursor < regular.length && !cancelled()) await processFile(regular[regularCursor++]);
+    };
+    const ncmWorker = async () => {
+      for (const index of ncm) { if (cancelled()) break; await processFile(index); }
+    };
     try {
-      await Promise.all(Array.from({ length: Math.min(4, pending.length) }, worker));
+      await Promise.all([...Array.from({ length: Math.min(4, regular.length) }, regularWorker), ncmWorker()]);
       if (generation !== this._generation || this._destroyed) { summary.rejected += pending.length; return summary; }
       for (let i = 0; i < pending.length; i++) {
-        const { id, file } = pending[i];
-        this._appendTrack(id, file, results[i]);
+        if (!results[i]) { summary.rejected++; continue; }
+        const { file, metadata } = results[i];
+        this._appendTrack(pending[i].id, file, metadata);
         summary.added++;
       }
       if (summary.added && this.remember) await this._save();
@@ -277,6 +348,7 @@ export class LocalLibrary extends EventTarget {
             id: track.id, title: track.title, artist: track.artist, album: track.album,
             file: track.file, name: track.file.name, lastModified: track.file.lastModified,
             artworkBlob: this._artworkBlobs.get(track.id) ?? null,
+            convertedFromNcm: track.convertedFromNcm, sourceName: track.sourceName,
           });
         }
       } catch (error) {

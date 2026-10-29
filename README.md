@@ -21,6 +21,23 @@
 - HOLD：锁定机身按键，音乐继续播放。
 - 键盘 ↑ / ↓ 浏览，Enter 确认，Esc 返回，空格播放 / 暂停，← / → 切歌。
 - “设置”中可切换随机、循环、转盘声、音量与机身颜色。
+- 页面右上角“夜间”切换黑夜模式，iPod 同时变成黑色；可在“设置”中切换，浏览器会记住选择。
+
+## 经典小游戏
+
+在 iPod 主菜单打开“游戏”，可玩打砖块、降落伞和完整 Klondike 纸牌。它们是按经典玩法重新实现的游戏，不使用原厂固件。
+
+- 打砖块：转盘或 ← / → 移动挡板，中键发球。三条生命、三关。
+- 降落伞：转盘或 ← / → 瞄准，中键发射；阻止同侧四名伞兵落地。
+- 纸牌：转盘选择牌堆，中键取牌或放牌；↑ / ↓ 选择列内的牌，也可点屏幕。U 撤回。
+- 播放键暂停，MENU 返回，R 重新开始。HOLD 和切到后台会暂停游戏。
+- 进入游戏会暂停音乐。退出后可自行继续播放。
+
+## NCM 本地解包与下载
+
+选择或拖入 `.ncm` 文件即可在浏览器内解包，随后使用解包出的 MP3 或 FLAC 播放。歌曲右侧的 **↓** 按钮可将解包音乐保存到设备。输出保留原始音频编码，不进行有损转码。
+
+解包、元数据与内嵌封面读取均在本地完成，不请求在线封面地址，不使用解包服务器。保留曲库时只保存解包后的浏览器副本。损坏、缺失音频或不支持的封装会提示导入失败，其他歌曲仍可继续导入。
 
 ## 音乐隐私
 
@@ -64,3 +81,5 @@ npm test
 这是独立的 iPod 风格项目，与 Apple 无关联。参考经典 iPod 的交互方式，不包含 Apple 的实现代码或音乐。
 
 jsmediatags 许可证见 [`vendor/JSMEDIATAGS-LICENSE.md`](vendor/JSMEDIATAGS-LICENSE.md)。
+
+NCM 封装布局参考 [taurusxin/ncmdump 的 ncmcrypt.cpp](https://github.com/taurusxin/ncmdump/blob/main/src/ncmcrypt.cpp)（[MIT 许可证](https://github.com/taurusxin/ncmdump/blob/main/LICENSE.txt)）。AES 实现使用随页面提供的 [CryptoJS](https://github.com/brix/crypto-js)，许可证见 [`vendor/CRYPTOJS-LICENSE.txt`](vendor/CRYPTOJS-LICENSE.txt)。运行时不访问这些网站。
